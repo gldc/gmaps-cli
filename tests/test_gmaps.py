@@ -184,24 +184,6 @@ def test_search_limit_maps_to_pagesize():
     assert rec.body_json()["pageSize"] == 3
 
 
-def test_search_trim_shape_default():
-    payload = {
-        "places": [
-            {
-                "id": "P1",
-                "displayName": {"text": "Café X", "languageCode": "fr"},
-                "formattedAddress": "1 rue Principale",
-                "location": {"latitude": 45.5, "longitude": -73.5},
-                "types": ["cafe", "food"],
-                "googleMapsUri": "https://maps.google.com/?cid=1",
-            }
-        ]
-    }
-    rec = ok(payload=payload)
-    gmaps.main(["search", "coffee"], transport=rec)
-    # asserted separately via capsys in test_search_trim_output
-
-
 def test_search_trim_output(capsys):
     payload = {
         "places": [

@@ -94,7 +94,9 @@ gmaps revgeocode 45.5017,-73.5673            # positional form also works
 ```
 
 Reverse geocode takes coordinates as `--at=LAT,LNG` or as a plain positional.
-The flag form is handy when a negative latitude would otherwise look like a flag.
+Prefer the `--at=` form in scripts and agent wrappers — a negative latitude as a
+positional looks like a flag to some argv-validating wrappers, and `--at=` is
+accepted everywhere.
 
 ### `route` — travel time and distance
 
@@ -199,6 +201,10 @@ field-mask override flag.
 Practical guidance for agents: start with `search` (Pro), only add `--detailed`
 when you actually need ratings or hours, and only call `place` for a result the
 user has chosen. `--reviews` is the most expensive path — request it explicitly.
+
+> **Running this under an AI agent?** Ship [`SKILL.md`](SKILL.md) into your
+> harness's skills directory — it teaches the command surface, the JSON/exit-code
+> contract, and the cost discipline in the standard agent-skill format.
 
 ## Design principles
 
