@@ -103,6 +103,9 @@ def test_field_mask_table_is_verbatim():
             "editorialSummary,reviews"
         ),
         "route": "routes.distanceMeters,routes.duration,routes.description",
+        "matrix": (
+            "originIndex,destinationIndex,status,condition,distanceMeters,duration"
+        ),
     }
 
 
