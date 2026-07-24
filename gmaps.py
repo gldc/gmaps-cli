@@ -1,11 +1,15 @@
 #!/usr/bin/python3 -I
 """gmaps — a zero-dependency Google Maps CLI for AI agents and humans.
 
-Wraps the Places API (New), Geocoding v4, and Routes API in a single stdlib-only
-Python file. Output is a compact JSON envelope on stdout; errors are a JSON
-envelope on stderr with stable exit codes. The API key is read only from the
-``GMAPS_API_KEY`` environment variable and sent via the ``X-Goog-Api-Key``
-header — it never appears in argv, a URL, or any output stream.
+Wraps the Places API (New), Geocoding v4, Routes API, Time Zone API, and
+Weather API in a single stdlib-only Python file. Output is a compact JSON
+envelope on stdout; errors are a JSON envelope on stderr with stable exit
+codes. The API key is read only from the ``GMAPS_API_KEY`` environment
+variable and sent via the ``X-Goog-Api-Key`` header where supported (Places,
+Geocoding, Routes); the Time Zone and Weather services only document the
+``?key=`` query-parameter form, so for those two the key rides the request URL
+— it still never appears in argv or any output stream (all output is scrubbed
+at the emit boundary).
 
 Design notes:
 
@@ -22,6 +26,7 @@ import json
 import os
 import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +40,9 @@ PLACES_DETAILS_BASE = "https://places.googleapis.com/v1/places/"
 GEOCODE_FWD_BASE = "https://geocode.googleapis.com/v4/geocode/address/"
 GEOCODE_REV_BASE = "https://geocode.googleapis.com/v4/geocode/location/"
 ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+TIMEZONE_URL = "https://maps.googleapis.com/maps/api/timezone/json"
+WEATHER_BASE = "https://weather.googleapis.com/v1/"
 
 TIMEOUT = 10  # seconds; kept below any supervising process's kill timeout.
 
@@ -66,9 +74,14 @@ FIELD_MASKS = {
     "place": _PLACE_BASE,
     "place_reviews": _PLACE_BASE + "," + _PLACE_REVIEW_EXTRA,
     "route": "routes.distanceMeters,routes.duration,routes.description",
+    # MUST include `status`: without it every matrix element reads as OK.
+    "matrix": "originIndex,destinationIndex,status,condition,distanceMeters,duration",
 }
 
 DEFAULT_LIMIT = 8
+WEATHER_MAX_DAYS = 10  # API maximum
+WEATHER_MAX_HOURS = 24  # forecast/hours pageSize maxes at 24; no pagination
+MATRIX_MAX_SIDE = 10  # 10x10 = 100 elements; API cap is 625 (100 for transit)
 SEARCH_DEFAULT_RADIUS = 5000
 NEARBY_DEFAULT_RADIUS = 1500
 MAX_RADIUS = 50000
@@ -111,6 +124,9 @@ def redact(text, secret):
     """
     if secret and len(secret) >= 4:
         text = text.replace(secret, "***")
+        encoded = urllib.parse.quote_plus(secret)
+        if encoded != secret:
+            text = text.replace(encoded, "***")
     return text
 
 
@@ -218,7 +234,10 @@ def _call(transport, method, url, headers, body_obj=None):
         )
     if status == 200:
         try:
-            return json.loads(raw.decode("utf-8"))
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, (dict, list)):
+                raise ValueError("non-container JSON body")
+            return parsed
         except (ValueError, UnicodeDecodeError):
             raise GmapsError(
                 "upstream",
@@ -363,6 +382,73 @@ def _trim_geocode(result):
     return out
 
 
+def _cond_text(container):
+    return ((container.get("weatherCondition") or {}).get("description") or {}).get(
+        "text"
+    )
+
+
+def _trim_weather_current(resp):
+    out = {}
+    _set(out, "condition", _cond_text(resp))
+    _set(out, "temp", (resp.get("temperature") or {}).get("degrees"))
+    _set(out, "feels_like", (resp.get("feelsLikeTemperature") or {}).get("degrees"))
+    _set(out, "humidity_pct", resp.get("relativeHumidity"))
+    wind = resp.get("wind") or {}
+    _set(out, "wind_kmh", (wind.get("speed") or {}).get("value"))
+    _set(out, "wind_dir", (wind.get("direction") or {}).get("cardinal"))
+    precip = ((resp.get("precipitation") or {}).get("probability")) or {}
+    _set(out, "precip_prob_pct", precip.get("percent"))
+    _set(out, "uv_index", resp.get("uvIndex"))
+    _set(out, "cloud_pct", resp.get("cloudCover"))
+    return out
+
+
+def _weather_date(display_date):
+    y = display_date.get("year")
+    m = display_date.get("month")
+    d = display_date.get("day")
+    if y is None or m is None or d is None:
+        return None
+    return f"{y:04d}-{m:02d}-{d:02d}"
+
+
+def _trim_weather_day(day):
+    out = {}
+    _set(out, "date", _weather_date(day.get("displayDate") or {}))
+    daytime = day.get("daytimeForecast") or {}
+    night = day.get("nighttimeForecast") or {}
+    _set(out, "condition_day", _cond_text(daytime))
+    _set(out, "condition_night", _cond_text(night))
+    _set(out, "max", (day.get("maxTemperature") or {}).get("degrees"))
+    _set(out, "min", (day.get("minTemperature") or {}).get("degrees"))
+    _set(
+        out,
+        "precip_prob_pct",
+        (((daytime.get("precipitation") or {}).get("probability")) or {}).get(
+            "percent"
+        ),
+    )
+    return out
+
+
+def _trim_weather_hour(hour):
+    out = {}
+    _set(out, "time", hour.get("interval", {}).get("startTime"))
+    _set(
+        out,
+        "condition",
+        hour.get("weatherCondition", {}).get("description", {}).get("text"),
+    )
+    _set(out, "temp", hour.get("temperature", {}).get("degrees"))
+    _set(
+        out,
+        "precip_prob_pct",
+        hour.get("precipitation", {}).get("probability", {}).get("percent"),
+    )
+    return out
+
+
 def _duration_seconds(value):
     if isinstance(value, str) and value.endswith("s"):
         try:
@@ -497,6 +583,229 @@ def cmd_route(args, key, transport):
     return [_trim_route(r) for r in resp.get("routes", [])]
 
 
+# Time Zone API is a legacy web service: HTTP 200 with an embedded status enum.
+_TZ_STATUS_ERRORS = {
+    "ZERO_RESULTS": (
+        "not_found",
+        "No time zone for this location",
+        False,
+        4,
+        "Coordinates may be over open water.",
+    ),
+    "REQUEST_DENIED": (
+        "auth",
+        "Time Zone API request denied",
+        False,
+        3,
+        "Check that the API key permits the Time Zone API.",
+    ),
+    "INVALID_REQUEST": (
+        "usage",
+        "Invalid Time Zone API request",
+        False,
+        2,
+        "Check the --at coordinates.",
+    ),
+    "OVER_QUERY_LIMIT": (
+        "rate_limited",
+        "Time Zone API quota exceeded",
+        True,
+        5,
+        "Retry later.",
+    ),
+    "OVER_DAILY_LIMIT": (
+        "rate_limited",
+        "Time Zone API daily quota exceeded",
+        True,
+        5,
+        "Retry tomorrow or raise the quota cap.",
+    ),
+}
+
+
+def cmd_tz(args, key, transport):
+    if not args.at:
+        raise _usage(
+            "tz requires --at=LAT,LNG",
+            "Example: gmaps tz --at=45.63,-73.78",
+        )
+    _parse_latlng(args.at, "--at")
+    timestamp = args.time if args.time is not None else int(time.time())
+    url = (
+        TIMEZONE_URL
+        + "?"
+        + urllib.parse.urlencode(
+            {"location": args.at, "timestamp": timestamp, "key": key}
+        )
+    )
+    resp = _call(transport, "GET", url, {}, None)
+    if not isinstance(resp, dict):
+        raise GmapsError(
+            "upstream", "Malformed Time Zone API response", True, "Retry shortly.", 5
+        )
+    status = resp.get("status")
+    if status != "OK":
+        code, message, retryable, exit_code, hint = _TZ_STATUS_ERRORS.get(
+            status,
+            (
+                "upstream",
+                f"Time Zone API returned status {status}",
+                True,
+                5,
+                "Retry shortly.",
+            ),
+        )
+        raise GmapsError(code, message, retryable, hint, exit_code)
+    if args.raw:
+        return resp
+    raw_offset = resp.get("rawOffset", 0)
+    dst_offset = resp.get("dstOffset", 0)
+    return {
+        "timezone_id": resp.get("timeZoneId"),
+        "timezone_name": resp.get("timeZoneName"),
+        "raw_offset_s": raw_offset,
+        "dst_offset_s": dst_offset,
+        "utc_offset_s": raw_offset + dst_offset,
+    }
+
+
+def _resolve_location(args, key, transport):
+    """LAT,LNG strings for --at, else forward-geocode the positional place."""
+    if args.at:
+        lat, lng = _parse_latlng(args.at, "--at")
+        raw_lat, raw_lng = args.at.split(",", 1)
+        return raw_lat.strip(), raw_lng.strip()
+    if args.place:
+        url = GEOCODE_FWD_BASE + urllib.parse.quote(args.place, safe="")
+        resp = _call(transport, "GET", url, {"X-Goog-Api-Key": key}, None)
+        results = resp.get("results", [])
+        if not results:
+            raise GmapsError(
+                "not_found",
+                f"Could not geocode {args.place!r}",
+                False,
+                "Try a more specific place name or pass --at=LAT,LNG.",
+                4,
+            )
+        loc = results[0].get("location") or {}
+        lat, lng = loc.get("latitude"), loc.get("longitude")
+        if lat is None or lng is None:
+            raise GmapsError(
+                "not_found",
+                f"Geocode result for {args.place!r} has no coordinates",
+                False,
+                "Try a more specific place name or pass --at=LAT,LNG.",
+                4,
+            )
+        return str(lat), str(lng)
+    raise _usage(
+        "weather requires a place or --at=LAT,LNG",
+        'Examples: gmaps weather "Rosemère QC" · gmaps weather --at=45.63,-73.78',
+    )
+
+
+def cmd_weather(args, key, transport):
+    if args.days is not None and args.hours is not None:
+        raise _usage(
+            "--days and --hours are mutually exclusive",
+            "Pick one forecast granularity.",
+        )
+    if args.days is not None and not 1 <= args.days <= WEATHER_MAX_DAYS:
+        raise _usage(
+            f"--days must be 1-{WEATHER_MAX_DAYS}",
+            "Example: gmaps weather --at=45.63,-73.78 --days=3",
+        )
+    if args.hours is not None and not 1 <= args.hours <= WEATHER_MAX_HOURS:
+        raise _usage(
+            f"--hours must be 1-{WEATHER_MAX_HOURS}",
+            "Example: gmaps weather --at=45.63,-73.78 --hours=6",
+        )
+    lat, lng = _resolve_location(args, key, transport)
+    params = {"key": key, "location.latitude": lat, "location.longitude": lng}
+    if args.days is not None:
+        endpoint = "forecast/days:lookup"
+        params["days"] = args.days
+        params["pageSize"] = args.days
+    elif args.hours is not None:
+        endpoint = "forecast/hours:lookup"
+        params["hours"] = args.hours
+        params["pageSize"] = args.hours
+    else:
+        endpoint = "currentConditions:lookup"
+    if args.units:
+        params["unitsSystem"] = args.units.upper()
+    if args.lang:
+        params["languageCode"] = args.lang
+    url = WEATHER_BASE + endpoint + "?" + urllib.parse.urlencode(params)
+    resp = _call(transport, "GET", url, {}, None)
+    if not isinstance(resp, dict):
+        raise GmapsError(
+            "upstream", "Malformed Weather API response", True, "Retry shortly.", 5
+        )
+    if args.raw:
+        return resp
+    if args.days is not None:
+        return [_trim_weather_day(d) for d in resp.get("forecastDays", [])]
+    if args.hours is not None:
+        return [_trim_weather_hour(h) for h in resp.get("forecastHours", [])]
+    return _trim_weather_current(resp)
+
+
+def cmd_matrix(args, key, transport):
+    origins = args.origins or []
+    dests = args.dests or []
+    if (
+        not 1 <= len(origins) <= MATRIX_MAX_SIDE
+        or not 1 <= len(dests) <= MATRIX_MAX_SIDE
+    ):
+        raise _usage(
+            f"matrix needs 1-{MATRIX_MAX_SIDE} --from and 1-{MATRIX_MAX_SIDE} --to",
+            'Example: gmaps matrix --from="Home St" --from="Work Ave" --to="Airport"',
+        )
+    body = {
+        "origins": [{"waypoint": _waypoint(v)} for v in origins],
+        "destinations": [{"waypoint": _waypoint(v)} for v in dests],
+        "travelMode": args.mode.upper(),
+    }
+    headers = {"X-Goog-Api-Key": key, "X-Goog-FieldMask": FIELD_MASKS["matrix"]}
+    resp = _call(transport, "POST", MATRIX_URL, headers, body)
+    if not isinstance(resp, list):
+        detail = None
+        if isinstance(resp, dict):
+            err = resp.get("error")
+            if isinstance(err, dict):
+                detail = err.get("message")
+        raise GmapsError(
+            "upstream",
+            detail or "Unexpected Route Matrix response",
+            True,
+            "Retry shortly.",
+            5,
+        )
+    if args.raw:
+        return resp
+    elements = sorted(
+        resp,
+        key=lambda e: (e.get("originIndex", 0), e.get("destinationIndex", 0)),
+    )
+    out = []
+    for el in elements:
+        row = {}
+        oi, di = el.get("originIndex", 0), el.get("destinationIndex", 0)
+        if oi < len(origins):
+            row["from"] = origins[oi]
+        if di < len(dests):
+            row["to"] = dests[di]
+        _set(row, "distance_m", el.get("distanceMeters"))
+        _set(row, "duration_s", _duration_seconds(el.get("duration")))
+        _set(row, "condition", el.get("condition"))
+        el_status = el.get("status") or {}
+        if el_status.get("code"):
+            _set(row, "error", el_status.get("message") or "element failed")
+        out.append(row)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Argument parser
 # --------------------------------------------------------------------------- #
@@ -572,6 +881,33 @@ def build_parser():
     rtp.add_argument("--lang", metavar="CODE")
     rtp.add_argument("--raw", action="store_true")
     rtp.set_defaults(func=cmd_route)
+
+    tzp = _add_subparser(sub, "tz", "Time zone at a coordinate")
+    tzp.add_argument("--at", metavar="LAT,LNG")
+    tzp.add_argument("--time", type=int, metavar="EPOCH")
+    tzp.add_argument("--raw", action="store_true")
+    tzp.set_defaults(func=cmd_tz)
+
+    wp = _add_subparser(sub, "weather", "Current conditions or forecast")
+    wp.add_argument("place", nargs="?", metavar="PLACE")
+    wp.add_argument("--at", metavar="LAT,LNG")
+    wp.add_argument("--days", type=int, metavar="N")
+    wp.add_argument("--hours", type=int, metavar="N")
+    wp.add_argument("--units", choices=["metric", "imperial"])
+    wp.add_argument("--lang", metavar="CODE")
+    wp.add_argument("--raw", action="store_true")
+    wp.set_defaults(func=cmd_weather)
+
+    mp = _add_subparser(
+        sub, "matrix", "Distance/time for many origin-destination pairs"
+    )
+    mp.add_argument("--from", dest="origins", action="append", metavar="ORIGIN")
+    mp.add_argument("--to", dest="dests", action="append", metavar="DEST")
+    mp.add_argument(
+        "--mode", choices=["drive", "walk", "bicycle", "transit"], default="drive"
+    )
+    mp.add_argument("--raw", action="store_true")
+    mp.set_defaults(func=cmd_matrix)
 
     return parser
 

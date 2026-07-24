@@ -46,6 +46,11 @@ gmaps geocode <address> [--lang=CODE] [--raw]
 gmaps revgeocode <LAT,LNG> | --at=LAT,LNG [--raw]
 gmaps route --from=ORIGIN --to=DEST [--mode=drive|walk|bicycle|transit]
              [--lang=CODE] [--raw]
+gmaps matrix --from=A [--from=B ...] --to=C [--to=D ...]
+             [--mode=drive|walk|bicycle|transit] [--raw]
+gmaps tz --at=LAT,LNG [--time=EPOCH] [--raw]
+gmaps weather <place> | --at=LAT,LNG [--days=N | --hours=N]
+             [--units=metric|imperial] [--lang=CODE] [--raw]
 ```
 
 ### `search` — Places Text Search
@@ -111,6 +116,38 @@ gmaps route --from=45.53,-73.61 --to=placeid:ChIJDbdkHFQayUwR7-8fITgxTmU --mode=
 Distance and duration only — no polyline, no turn-by-turn (keeps output small
 and the request in the cheapest SKU).
 
+### `matrix` — many origins × many destinations
+
+Repeat `--from` and `--to` (up to 10 each; billed per origin×destination
+element). Same waypoint forms as `route`.
+
+```bash
+gmaps matrix --from="Home St, Rosemère" --from="Work Ave" --to="YUL Airport" --to="Downtown"
+```
+
+### `tz` — time zone at a coordinate
+
+```bash
+gmaps tz --at=45.5017,-73.5673
+# {"ok":true,"data":{"timezone_id":"America/Toronto","utc_offset_s":-14400,...}}
+```
+
+`--time=EPOCH` evaluates DST for a specific moment (defaults to now).
+
+### `weather` — current conditions or forecast
+
+Takes a place name (geocoded first, one extra Essentials call) or `--at=LAT,LNG`.
+
+```bash
+gmaps weather "Rosemère QC"                 # current conditions
+gmaps weather --at=43.07,11.68 --days=5     # daily forecast (1-10)
+gmaps weather "Pienza" --hours=12 --units=metric
+```
+
+> Note: the Time Zone and Weather services document only `?key=` query-param
+> auth, so for those two calls the key is in the request URL (over TLS). It is
+> still scrubbed from every output stream.
+
 ## Output & agent contract
 
 Success goes to **stdout** as compact JSON; errors go to **stderr**. The shape is
@@ -145,9 +182,12 @@ upstream JSON instead (still limited to the fields in the mask).
 internal retries, so the retry policy is entirely the caller's. The HTTP timeout
 is a fixed 10 seconds and there is no `--timeout` flag.
 
-The resolved API key is sent only in the `X-Goog-Api-Key` request header. It
-never appears in argv, a URL, stdout, or stderr — including error paths, where
-the key is scrubbed from any message before it is printed.
+For Places, Geocoding, and Routes calls the resolved API key is sent only in
+the `X-Goog-Api-Key` request header. The Time Zone and Weather services
+document only `?key=` auth, so for `tz` and `weather` the key rides the
+request URL (over TLS). In every case it never appears in argv, stdout, or
+stderr — including error paths, where both the raw and URL-encoded key forms
+are scrubbed from any message before it is printed.
 
 ## API key setup
 
@@ -158,21 +198,26 @@ export GMAPS_API_KEY="AIza..."
 ```
 
 Create a key with `gcloud` and restrict it to exactly the APIs this tool uses —
-Places (New), Routes, and Geocoding — so a leaked key cannot reach anything else:
+Places (New), Routes, Geocoding, Time Zone, and Weather — so a leaked key
+cannot reach anything else:
 
 ```bash
-# Enable the three backends
+# Enable the five backends
 gcloud services enable \
   places.googleapis.com \
   routes.googleapis.com \
-  geocoding-backend.googleapis.com
+  geocoding-backend.googleapis.com \
+  timezone-backend.googleapis.com \
+  weather.googleapis.com
 
 # Create an API-restricted key (prints keyString once — capture it safely)
 gcloud services api-keys create \
   --display-name="gmaps-cli" \
   --api-target=service=places.googleapis.com \
   --api-target=service=routes.googleapis.com \
-  --api-target=service=geocoding-backend.googleapis.com
+  --api-target=service=geocoding-backend.googleapis.com \
+  --api-target=service=timezone-backend.googleapis.com \
+  --api-target=service=weather.googleapis.com
 
 # Read the key string back later if needed
 gcloud services api-keys get-key-string KEY_ID --format='value(keyString)'
@@ -196,6 +241,9 @@ field-mask override flag.
 | `place` | Places Enterprise | full contact + opening hours for one chosen place |
 | `place --reviews` | Enterprise + Atmosphere | adds editorial summary + review snippets |
 | `route` | Routes Essentials | distance + duration only; never sets `routingPreference` |
+| `matrix` | Routes Essentials | billed per origin×destination element; never traffic-aware |
+| `tz` | Time Zone Essentials | single lookup |
+| `weather` | Weather Essentials | current or forecast; place form adds one Geocoding call |
 | `geocode`, `revgeocode` | Geocoding Essentials | no field mask required |
 
 Practical guidance for agents: start with `search` (Pro), only add `--detailed`

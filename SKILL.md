@@ -1,6 +1,6 @@
 ---
 name: gmaps
-description: "Google Maps: search, ratings, hours, routes (gmaps CLI)."
+description: "Google Maps places, routes, matrix, weather, time zones (CLI)."
 ---
 
 # gmaps — Google Maps lookups from the shell
@@ -8,8 +8,9 @@ description: "Google Maps: search, ratings, hours, routes (gmaps CLI)."
 ## When to Use
 
 Use `gmaps` whenever you need real-world place data: finding businesses or POIs,
-ratings and opening hours, converting addresses to coordinates (or back), or
-travel time/distance between two points. Prefer it over scraping or guessing —
+ratings and opening hours, converting addresses to coordinates (or back),
+travel time/distance (one pair via `route`, many via `matrix`), the time zone
+at a location (`tz`), or weather — current conditions or forecast (`weather`). Prefer it over scraping or guessing —
 results come from the Google Maps Platform.
 
 ## Prerequisites
@@ -39,6 +40,10 @@ gmaps place ChIJDbdkHFQayUwR7-8fITgxTmU --reviews  # + editorial summary, 3 revi
 gmaps geocode "Piazza del Campo, Siena"
 gmaps revgeocode --at=45.5017,-73.5673
 gmaps route --from="Rosemère, QC" --to="Trudeau Airport" --mode=drive
+gmaps matrix --from="Home" --from="Work" --to="Airport"   # many-to-many times
+gmaps tz --at=45.5017,-73.5673                            # IANA tz + UTC offset
+gmaps weather "Rosemère QC"                               # current conditions
+gmaps weather --at=43.07,11.68 --days=5                   # daily forecast
 ```
 
 `route` waypoints accept an address, `LAT,LNG`, or `placeid:<id>`. Modes:
