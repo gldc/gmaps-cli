@@ -1,6 +1,6 @@
 ---
 name: gmaps
-description: Google Maps: search places, ratings, hours, routes (gmaps CLI).
+description: "Google Maps: search, ratings, hours, routes (gmaps CLI)."
 ---
 
 # gmaps — Google Maps lookups from the shell
