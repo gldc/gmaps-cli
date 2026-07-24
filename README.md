@@ -182,9 +182,12 @@ upstream JSON instead (still limited to the fields in the mask).
 internal retries, so the retry policy is entirely the caller's. The HTTP timeout
 is a fixed 10 seconds and there is no `--timeout` flag.
 
-The resolved API key is sent only in the `X-Goog-Api-Key` request header. It
-never appears in argv, a URL, stdout, or stderr — including error paths, where
-the key is scrubbed from any message before it is printed.
+For Places, Geocoding, and Routes calls the resolved API key is sent only in
+the `X-Goog-Api-Key` request header. The Time Zone and Weather services
+document only `?key=` auth, so for `tz` and `weather` the key rides the
+request URL (over TLS). In every case it never appears in argv, stdout, or
+stderr — including error paths, where both the raw and URL-encoded key forms
+are scrubbed from any message before it is printed.
 
 ## API key setup
 
@@ -195,21 +198,26 @@ export GMAPS_API_KEY="AIza..."
 ```
 
 Create a key with `gcloud` and restrict it to exactly the APIs this tool uses —
-Places (New), Routes, and Geocoding — so a leaked key cannot reach anything else:
+Places (New), Routes, Geocoding, Time Zone, and Weather — so a leaked key
+cannot reach anything else:
 
 ```bash
-# Enable the three backends
+# Enable the five backends
 gcloud services enable \
   places.googleapis.com \
   routes.googleapis.com \
-  geocoding-backend.googleapis.com
+  geocoding-backend.googleapis.com \
+  timezone-backend.googleapis.com \
+  weather.googleapis.com
 
 # Create an API-restricted key (prints keyString once — capture it safely)
 gcloud services api-keys create \
   --display-name="gmaps-cli" \
   --api-target=service=places.googleapis.com \
   --api-target=service=routes.googleapis.com \
-  --api-target=service=geocoding-backend.googleapis.com
+  --api-target=service=geocoding-backend.googleapis.com \
+  --api-target=service=timezone-backend.googleapis.com \
+  --api-target=service=weather.googleapis.com
 
 # Read the key string back later if needed
 gcloud services api-keys get-key-string KEY_ID --format='value(keyString)'

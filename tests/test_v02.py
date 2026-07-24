@@ -261,7 +261,7 @@ def test_weather_place_not_found():
         ["weather", "--at=1,1", "--days=0"],
         ["weather", "--at=1,1", "--days=11"],
         ["weather", "--at=1,1", "--hours=0"],
-        ["weather", "--at=1,1", "--hours=49"],
+        ["weather", "--at=1,1", "--hours=25"],
     ],
 )
 def test_weather_usage_errors(argv):
@@ -408,3 +408,103 @@ def test_matrix_default_mode_is_drive():
     rec = matrix_rec()
     gmaps.main(["matrix", "--from=A", "--to=B"], transport=rec)
     assert rec.body_json()["travelMode"] == "DRIVE"
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes (adversarial review of feat/v0.2)
+# --------------------------------------------------------------------------- #
+
+
+def test_weather_hours_cap_is_24():
+    # forecast/hours pageSize maxes at 24 and the CLI never paginates
+    assert gmaps.WEATHER_MAX_HOURS == 24
+
+
+def test_matrix_dict_response_is_upstream_error(capsys):
+    rec = Recorder(payload={"error": {"message": "boom"}})
+    assert gmaps.main(["matrix", "--from=A", "--to=B"], transport=rec) == 5
+    err = json.loads(capsys.readouterr().err)
+    assert err["ok"] is False
+    assert err["error"]["retryable"] is True
+
+
+def test_tz_non_dict_response_is_upstream_error(capsys):
+    rec = Recorder(raw=b"[1,2]")
+    assert gmaps.main(["tz", "--at=1,1"], transport=rec) == 5
+    json.loads(capsys.readouterr().err)  # a JSON envelope, not a traceback
+
+
+def test_weather_non_dict_response_is_upstream_error(capsys):
+    rec = Recorder(raw=b"[]")
+    assert gmaps.main(["weather", "--at=1,1"], transport=rec) == 5
+    json.loads(capsys.readouterr().err)
+
+
+def test_matrix_element_error_status_surfaced(capsys):
+    resp = [
+        {
+            "originIndex": 0,
+            "destinationIndex": 0,
+            "status": {"code": 3, "message": "Origin cannot be geocoded"},
+            "condition": "ROUTE_NOT_FOUND",
+        }
+    ]
+    rec = Recorder(raw=json.dumps(resp).encode("utf-8"))
+    assert gmaps.main(["matrix", "--from=A", "--to=B"], transport=rec) == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert data[0]["error"] == "Origin cannot be geocoded"
+    assert data[0]["condition"] == "ROUTE_NOT_FOUND"
+
+
+def test_weather_current_null_fields_no_crash(capsys):
+    rec = Recorder(
+        payload={
+            "temperature": None,
+            "weatherCondition": None,
+            "wind": None,
+            "precipitation": None,
+            "feelsLikeTemperature": None,
+        }
+    )
+    assert gmaps.main(["weather", "--at=1,1"], transport=rec) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_weather_day_null_fields_no_crash():
+    rec = Recorder(
+        payload={
+            "forecastDays": [
+                {
+                    "displayDate": None,
+                    "daytimeForecast": None,
+                    "nighttimeForecast": None,
+                    "maxTemperature": None,
+                    "minTemperature": None,
+                }
+            ]
+        }
+    )
+    assert gmaps.main(["weather", "--at=1,1", "--days=1"], transport=rec) == 0
+
+
+URLKEY = "TESTKEY+abc/123=="  # urlencodes to TESTKEY%2Babc%2F123%3D%3D
+
+
+def test_urlencoded_key_scrubbed_from_error_output(capsys, monkeypatch):
+    # The headline v0.2 risk: the key rides the URL for tz/weather. If Google
+    # ever echoes request params in an error message, BOTH the raw and the
+    # percent-encoded key forms must be scrubbed.
+    monkeypatch.setenv("GMAPS_API_KEY", URLKEY)
+    enc = urllib.parse.quote_plus(URLKEY)
+    raw = json.dumps({"error": {"message": f"bad request for ?key={enc}"}})
+    rec = Recorder(status=400, raw=raw.encode("utf-8"))
+    assert gmaps.main(["tz", "--at=1,1"], transport=rec) == 4
+    out = capsys.readouterr()
+    assert URLKEY not in out.out + out.err
+    assert enc not in out.out + out.err
+    assert "***" in out.err
+
+
+def test_weather_geocode_result_missing_location_is_not_found():
+    seq = Seq([(200, {"results": [{"placeId": "x"}]})])
+    assert gmaps.main(["weather", "Rosemère"], transport=seq) == 4

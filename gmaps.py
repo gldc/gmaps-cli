@@ -80,7 +80,7 @@ FIELD_MASKS = {
 
 DEFAULT_LIMIT = 8
 WEATHER_MAX_DAYS = 10  # API maximum
-WEATHER_MAX_HOURS = 48  # API allows 240; capped for output size
+WEATHER_MAX_HOURS = 24  # forecast/hours pageSize maxes at 24; no pagination
 MATRIX_MAX_SIDE = 10  # 10x10 = 100 elements; API cap is 625 (100 for transit)
 SEARCH_DEFAULT_RADIUS = 5000
 NEARBY_DEFAULT_RADIUS = 1500
@@ -124,6 +124,9 @@ def redact(text, secret):
     """
     if secret and len(secret) >= 4:
         text = text.replace(secret, "***")
+        encoded = urllib.parse.quote_plus(secret)
+        if encoded != secret:
+            text = text.replace(encoded, "***")
     return text
 
 
@@ -231,7 +234,10 @@ def _call(transport, method, url, headers, body_obj=None):
         )
     if status == 200:
         try:
-            return json.loads(raw.decode("utf-8"))
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, (dict, list)):
+                raise ValueError("non-container JSON body")
+            return parsed
         except (ValueError, UnicodeDecodeError):
             raise GmapsError(
                 "upstream",
@@ -376,17 +382,22 @@ def _trim_geocode(result):
     return out
 
 
+def _cond_text(container):
+    return ((container.get("weatherCondition") or {}).get("description") or {}).get(
+        "text"
+    )
+
+
 def _trim_weather_current(resp):
     out = {}
-    cond = resp.get("weatherCondition", {})
-    _set(out, "condition", cond.get("description", {}).get("text"))
-    _set(out, "temp", resp.get("temperature", {}).get("degrees"))
-    _set(out, "feels_like", resp.get("feelsLikeTemperature", {}).get("degrees"))
+    _set(out, "condition", _cond_text(resp))
+    _set(out, "temp", (resp.get("temperature") or {}).get("degrees"))
+    _set(out, "feels_like", (resp.get("feelsLikeTemperature") or {}).get("degrees"))
     _set(out, "humidity_pct", resp.get("relativeHumidity"))
-    wind = resp.get("wind", {})
-    _set(out, "wind_kmh", wind.get("speed", {}).get("value"))
-    _set(out, "wind_dir", wind.get("direction", {}).get("cardinal"))
-    precip = resp.get("precipitation", {}).get("probability", {})
+    wind = resp.get("wind") or {}
+    _set(out, "wind_kmh", (wind.get("speed") or {}).get("value"))
+    _set(out, "wind_dir", (wind.get("direction") or {}).get("cardinal"))
+    precip = ((resp.get("precipitation") or {}).get("probability")) or {}
     _set(out, "precip_prob_pct", precip.get("percent"))
     _set(out, "uv_index", resp.get("uvIndex"))
     _set(out, "cloud_pct", resp.get("cloudCover"))
@@ -404,25 +415,19 @@ def _weather_date(display_date):
 
 def _trim_weather_day(day):
     out = {}
-    _set(out, "date", _weather_date(day.get("displayDate", {})))
-    daytime = day.get("daytimeForecast", {})
-    night = day.get("nighttimeForecast", {})
-    _set(
-        out,
-        "condition_day",
-        daytime.get("weatherCondition", {}).get("description", {}).get("text"),
-    )
-    _set(
-        out,
-        "condition_night",
-        night.get("weatherCondition", {}).get("description", {}).get("text"),
-    )
-    _set(out, "max", day.get("maxTemperature", {}).get("degrees"))
-    _set(out, "min", day.get("minTemperature", {}).get("degrees"))
+    _set(out, "date", _weather_date(day.get("displayDate") or {}))
+    daytime = day.get("daytimeForecast") or {}
+    night = day.get("nighttimeForecast") or {}
+    _set(out, "condition_day", _cond_text(daytime))
+    _set(out, "condition_night", _cond_text(night))
+    _set(out, "max", (day.get("maxTemperature") or {}).get("degrees"))
+    _set(out, "min", (day.get("minTemperature") or {}).get("degrees"))
     _set(
         out,
         "precip_prob_pct",
-        daytime.get("precipitation", {}).get("probability", {}).get("percent"),
+        (((daytime.get("precipitation") or {}).get("probability")) or {}).get(
+            "percent"
+        ),
     )
     return out
 
@@ -634,6 +639,10 @@ def cmd_tz(args, key, transport):
         )
     )
     resp = _call(transport, "GET", url, {}, None)
+    if not isinstance(resp, dict):
+        raise GmapsError(
+            "upstream", "Malformed Time Zone API response", True, "Retry shortly.", 5
+        )
     status = resp.get("status")
     if status != "OK":
         code, message, retryable, exit_code, hint = _TZ_STATUS_ERRORS.get(
@@ -678,8 +687,17 @@ def _resolve_location(args, key, transport):
                 "Try a more specific place name or pass --at=LAT,LNG.",
                 4,
             )
-        loc = results[0].get("location", {})
-        return str(loc.get("latitude")), str(loc.get("longitude"))
+        loc = results[0].get("location") or {}
+        lat, lng = loc.get("latitude"), loc.get("longitude")
+        if lat is None or lng is None:
+            raise GmapsError(
+                "not_found",
+                f"Geocode result for {args.place!r} has no coordinates",
+                False,
+                "Try a more specific place name or pass --at=LAT,LNG.",
+                4,
+            )
+        return str(lat), str(lng)
     raise _usage(
         "weather requires a place or --at=LAT,LNG",
         'Examples: gmaps weather "Rosemère QC" · gmaps weather --at=45.63,-73.78',
@@ -720,6 +738,10 @@ def cmd_weather(args, key, transport):
         params["languageCode"] = args.lang
     url = WEATHER_BASE + endpoint + "?" + urllib.parse.urlencode(params)
     resp = _call(transport, "GET", url, {}, None)
+    if not isinstance(resp, dict):
+        raise GmapsError(
+            "upstream", "Malformed Weather API response", True, "Retry shortly.", 5
+        )
     if args.raw:
         return resp
     if args.days is not None:
@@ -747,10 +769,23 @@ def cmd_matrix(args, key, transport):
     }
     headers = {"X-Goog-Api-Key": key, "X-Goog-FieldMask": FIELD_MASKS["matrix"]}
     resp = _call(transport, "POST", MATRIX_URL, headers, body)
+    if not isinstance(resp, list):
+        detail = None
+        if isinstance(resp, dict):
+            err = resp.get("error")
+            if isinstance(err, dict):
+                detail = err.get("message")
+        raise GmapsError(
+            "upstream",
+            detail or "Unexpected Route Matrix response",
+            True,
+            "Retry shortly.",
+            5,
+        )
     if args.raw:
         return resp
     elements = sorted(
-        resp if isinstance(resp, list) else [],
+        resp,
         key=lambda e: (e.get("originIndex", 0), e.get("destinationIndex", 0)),
     )
     out = []
@@ -764,6 +799,9 @@ def cmd_matrix(args, key, transport):
         _set(row, "distance_m", el.get("distanceMeters"))
         _set(row, "duration_s", _duration_seconds(el.get("duration")))
         _set(row, "condition", el.get("condition"))
+        el_status = el.get("status") or {}
+        if el_status.get("code"):
+            _set(row, "error", el_status.get("message") or "element failed")
         out.append(row)
     return out
 
