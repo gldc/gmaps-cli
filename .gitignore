@@ -1,0 +1,15 @@
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+dist/
+*.egg-info/
+
+# secrets / local state — never commit
+.env
+*.env
+!.env.example
+
+# editor/os
+.DS_Store
